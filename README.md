@@ -1,3 +1,15 @@
+---
+title: OnCallEnv
+emoji: 🚨
+colorFrom: red
+colorTo: yellow
+sdk: docker
+app_port: 7860
+pinned: false
+tags:
+  - openenv
+---
+
 # OnCallEnv — RL Environment for On-Call Incident Response
 
 An OpenEnv-compliant reinforcement learning environment that simulates
