@@ -1,116 +1,100 @@
 """
 reward.py — RewardSignal and RewardCalculator
 
-Defines the reward computation logic for OnCallEnv.
+Stateless reward computation for OnCallEnv.
+All inputs are plain dicts / Pydantic models — no circular imports.
 """
 
 from __future__ import annotations
 
-from typing import Any, Dict, Literal
+from typing import Any, Dict
 
 from pydantic import BaseModel, Field
 
-# Assuming these will be defined elsewhere or passed in
-# from env.environment import ActionModel, ObservationModel, TaskSpec
-# from env.services import ServiceRegistry, ServiceNode
 
-
-# ---------------------------------------------------------------------------
-# RewardSignal
-# ---------------------------------------------------------------------------
-
+# ── RewardSignal ─────────────────────────────────────────────────────────────
 
 class RewardSignal(BaseModel):
-    """Structured reward information for agent interpretability."""
+    """Structured reward returned after every step."""
 
     score: float
     reason: str
     breakdown: Dict[str, float] = Field(default_factory=dict)
 
 
-# ---------------------------------------------------------------------------
-# RewardCalculator
-# ---------------------------------------------------------------------------
-
+# ── RewardCalculator ─────────────────────────────────────────────────────────
 
 class RewardCalculator(BaseModel):
     """
-    Computes rewards based on pre-state, post-state, action, and task.
+    Pure-function reward calculator.
+
+    `compute()` receives snapshot dicts (not live objects) so there is
+    no dependency on environment.py or services.py at import time.
     """
 
-    # TODO: These types need to be properly imported or defined when environment.py exists
-    # For now, using Any to avoid circular dependencies
+    # ── public API ───────────────────────────────────────────────────────
+
     def compute(
         self,
-        action: Any,  # ActionModel
-        pre_state: Any,  # ObservationModel
-        post_state: Any,  # ObservationModel
-        task: Any,  # TaskSpec
+        action: Any,          # ActionModel
+        pre_state: Any,       # ObservationModel  (snapshot dicts inside)
+        post_state: Any,      # ObservationModel
+        task: Any,            # TaskSpec
+        resolved: bool = False,
     ) -> RewardSignal:
-        """Compute the reward for a given step."""
+        """Return the reward for a single step."""
         score = 0.0
         breakdown: Dict[str, float] = {}
 
-        # Time penalty
-        time_penalty = self._penalize_time(post_state.step_count)
-        score += time_penalty
-        breakdown["time_penalty"] = time_penalty
+        # ── time penalty ─────────────────────────────────────────────────
+        tp = self._time_penalty(post_state.step_count)
+        score += tp
+        breakdown["time_penalty"] = tp
 
-        # Action-specific rewards
+        # ── action-specific rewards ──────────────────────────────────────
+        target = action.target_service
+        pre_svc = pre_state.services.get(target, {})
+        post_svc = post_state.services.get(target, {})
+
         if action.action_type == "restart_service":
-            target_service_name = action.target_service
-            pre_service = pre_state.services.get(target_service_name)
-            post_service = post_state.services.get(target_service_name)
-
-            if pre_service and post_service:
-                if pre_service.status == "down" and post_service.status == "healthy":
-                    score += 5.0
-                    breakdown["restart_service_success"] = 5.0
-                elif pre_service.status == "healthy" and post_service.status == "healthy":
-                    score -= 2.0
-                    breakdown["restart_service_wasted"] = -2.0
+            if pre_svc.get("status") == "down" and post_svc.get("status") == "healthy":
+                score += 5.0
+                breakdown["restart_success"] = 5.0
+            elif pre_svc.get("status") == "healthy":
+                score -= 2.0
+                breakdown["restart_wasted"] = -2.0
 
         elif action.action_type == "rollback":
-            # This is a simplified check; actual rollback logic would be more complex
-            # and depend on the root cause being a 'deploy' related issue.
-            # For now, let's assume the task might have a 'root_cause' attribute.
-            if hasattr(task, "root_cause") and task.root_cause == "deploy":
-                # And assume action.target_service is the correct one
-                # This needs refinement once TaskSpec is fully defined.
+            if getattr(task, "root_cause", None) == "deploy":
                 score += 7.0
                 breakdown["rollback_success"] = 7.0
             else:
                 score -= 3.0
                 breakdown["rollback_wrong"] = -3.0
 
-        elif action.action_type == "scale":
-            target_service_name = action.target_service
-            post_service = post_state.services.get(target_service_name)
-            if post_service:
-                if post_service.cpu_pct > 85:
-                    score += 3.0
-                    breakdown["scale_needed"] = 3.0
-                elif post_service.cpu_pct < 50:
-                    score -= 1.0
-                    breakdown["scale_wasted"] = -1.0
+        elif action.action_type in ("scale_up", "scale_down"):
+            cpu = pre_svc.get("cpu_pct", 0)
+            if cpu > 85:
+                score += 3.0
+                breakdown["scale_needed"] = 3.0
+            elif cpu < 50:
+                score -= 1.0
+                breakdown["scale_wasted"] = -1.0
 
         elif action.action_type == "check_logs":
-            breakdown["check_logs_info"] = 0.0
+            breakdown["check_logs"] = 0.0
 
-        # Task resolved bonus
-        if self._is_task_resolved(post_state, task):
+        # ── resolution bonus ─────────────────────────────────────────────
+        if resolved:
             score += 10.0
-            breakdown["task_resolved_bonus"] = 10.0
+            breakdown["task_resolved"] = 10.0
 
-        return RewardSignal(score=score, reason="Reward computed for step", breakdown=breakdown)
+        reason = ", ".join(f"{k}={v:+.1f}" for k, v in breakdown.items())
+        return RewardSignal(score=score, reason=reason, breakdown=breakdown)
 
-    def _penalize_time(self, steps_elapsed: int) -> float:
-        """Applies a penalty for each step elapsed."""
-        return -0.5 * steps_elapsed
+    # ── internals ────────────────────────────────────────────────────────
 
-    def _is_task_resolved(self, post_state: Any, task: Any) -> bool:
-        """Checks if all services are healthy according to task success condition."""
-        # This will depend on the actual implementation of task.success_condition
-        if hasattr(task, "success_condition") and callable(task.success_condition):
-            return task.success_condition(post_state.services) # Assuming success_condition takes service dict
-        return False
+    @staticmethod
+    def _time_penalty(steps: int) -> float:
+        """−0.5 per step elapsed."""
+        return -0.5 * steps
