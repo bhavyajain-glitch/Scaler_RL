@@ -1,6 +1,20 @@
 spec_version: 1
 name: oncall_env
+description: "RL environment for on-call SRE incident response — agents diagnose and resolve distributed-system failures"
 type: space
 runtime: fastapi
 app: server.app:app
 port: 7860
+tasks:
+  - id: easy_db_crash
+    difficulty: easy
+    max_steps: 10
+    description: "Single-service crash: restore the database to healthy"
+  - id: medium_api_latency_worker_oom
+    difficulty: medium
+    max_steps: 15
+    description: "Multi-service failure: fix API latency spike and worker OOM simultaneously"
+  - id: hard_cascading_db_lock
+    difficulty: hard
+    max_steps: 20
+    description: "Cascading failure: identify DB lock as root cause before cascade degrades worker and API"

@@ -124,12 +124,15 @@ class ServiceNode(BaseModel):
     # ── Reset ────────────────────────────────────────────────────────────
 
     def reset_to_healthy(self) -> None:
-        """Restore every metric to its baseline and clear logs."""
+        """Restore every metric to its baseline and clear logs.
+
+        restart_count is intentionally preserved so the agent observation
+        continues to reflect how many restarts occurred this episode.
+        """
         self.cpu_pct = 10.0
         self.memory_pct = 20.0
         self.error_rate = 0.0
         self.latency_ms = 50.0
-        self.restart_count = 0
         self.uptime_steps = 0
         self.clear_logs()
         self.derive_status()

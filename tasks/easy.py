@@ -47,4 +47,6 @@ TASK = TaskSpec(
     ],
     success_condition=_all_healthy,
     max_steps=10,
+    root_cause_service="db",
+    expected_severity="sev2",
 )

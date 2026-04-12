@@ -2,7 +2,9 @@
 failures.py — FailureEvent and FailureInjector
 
 Fault injection engine for OnCallEnv.
-Applies failure state deltas to a ServiceRegistry.  Deterministic given a seed.
+Applies failure state deltas to a ServiceRegistry and populates each service's
+log ring-buffer with realistic, verbose messages (via log_templates).
+Deterministic given a seed.
 """
 
 from __future__ import annotations
@@ -13,9 +15,10 @@ from typing import Dict, List, Literal, Optional, Tuple
 from pydantic import BaseModel, PrivateAttr
 
 from env.services import ServiceRegistry
+from env.log_templates import get_failure_logs
 
 
-# ── Severity multipliers (low / medium / high) ──────────────────────────────
+# ── Severity multipliers (low / medium / high) ───────────────────────────────
 
 _SEVERITY = {
     "low":    0.4,
@@ -23,8 +26,15 @@ _SEVERITY = {
     "high":   1.0,
 }
 
+# CPU target ranges per severity so the spike is always visibly degraded/down
+_CPU_SPIKE_RANGE = {
+    "low":    (55.0, 75.0),   # often healthy, occasionally degraded
+    "medium": (75.0, 88.0),   # degraded
+    "high":   (88.0, 99.0),   # degraded → down
+}
 
-# ── FailureEvent ─────────────────────────────────────────────────────────────
+
+# ── FailureEvent ──────────────────────────────────────────────────────────────
 
 class FailureEvent(BaseModel):
     """Immutable description of a single failure to inject."""
@@ -38,7 +48,7 @@ class FailureEvent(BaseModel):
     model_config = {"frozen": True}
 
 
-# ── FailureInjector ──────────────────────────────────────────────────────────
+# ── FailureInjector ───────────────────────────────────────────────────────────
 
 class FailureInjector(BaseModel):
     """
@@ -48,15 +58,12 @@ class FailureInjector(BaseModel):
     never accidentally serialised into an observation.
     """
 
-    # seeded RNG for deterministic jitter
     _rng: random.Random = PrivateAttr(default_factory=random.Random)
-
-    # (event, remaining_heal_steps)  — remaining is None when manual-only
     _active: Dict[str, List[Tuple[FailureEvent, Optional[int]]]] = PrivateAttr(
         default_factory=dict,
     )
 
-    # ── Seed / reset ─────────────────────────────────────────────────────
+    # ── Seed / reset ──────────────────────────────────────────────────────
 
     def seed(self, seed: Optional[int] = None) -> None:
         """Re-seed the RNG and clear all tracked failures."""
@@ -64,50 +71,62 @@ class FailureInjector(BaseModel):
             self._rng.seed(seed)
         self._active.clear()
 
-    # ── Inject ───────────────────────────────────────────────────────────
+    # ── Inject ────────────────────────────────────────────────────────────
 
     def inject(self, event: FailureEvent, registry: ServiceRegistry) -> None:
         """Apply *event* to the target service in *registry*."""
         svc = registry.get_service(event.service)
         if svc is None:
-            return  # silently skip unknown services
+            return
 
         mult = _SEVERITY[event.severity]
 
+        # ── Metric mutations ──
         if event.failure_type == "cpu_spike":
-            svc.cpu_pct = min(100.0, svc.cpu_pct + self._rng.uniform(30, 60) * mult)
-            svc.emit_log("ERROR", f"CPU spike ({event.severity})")
+            lo, hi = _CPU_SPIKE_RANGE[event.severity]
+            svc.cpu_pct = self._rng.uniform(lo, hi)
 
         elif event.failure_type == "oom":
             svc.memory_pct = min(100.0, svc.memory_pct + self._rng.uniform(40, 70) * mult)
             svc.error_rate = 1.0
             svc.status = "down"
-            svc.emit_log("CRITICAL", "Out of memory — service crashed.")
 
         elif event.failure_type == "crash":
             svc.error_rate = 1.0
             svc.status = "down"
-            svc.emit_log("CRITICAL", "Service crashed unexpectedly.")
 
         elif event.failure_type == "latency":
             svc.latency_ms += self._rng.uniform(200, 800) * mult
             svc.error_rate = min(1.0, svc.error_rate + self._rng.uniform(0.1, 0.3) * mult)
-            svc.emit_log("ERROR", f"Latency spike ({event.severity})")
 
         elif event.failure_type == "db_lock":
             svc.error_rate = min(1.0, svc.error_rate + self._rng.uniform(0.3, 0.6) * mult)
-            svc.latency_ms += self._rng.uniform(300, 1000) * mult
-            svc.emit_log("WARN", "Database lock contention detected.")
+            svc.latency_ms += self._rng.uniform(300, 1_000) * mult
 
+        # ── Derive status from metrics ──
         svc.derive_status()
 
-        # Track for cascading / auto-heal
+        # ── Emit realistic log messages ──
+        for level, msg in get_failure_logs(event.failure_type, event.severity, self._rng):
+            svc.emit_log(level, msg)  # type: ignore[arg-type]
+
+        # ── Track for cascading / auto-heal ──
         if event.cascade_to or event.auto_heal_after is not None:
             self._active.setdefault(event.service, []).append(
                 (event, event.auto_heal_after),
             )
 
-    # ── Cascade ──────────────────────────────────────────────────────────
+    # ── Manual clear ──────────────────────────────────────────────────────
+
+    def clear_service(self, service_name: str) -> None:
+        """Remove all tracked failures for *service_name*.
+
+        Called when the agent manually heals a service (restart / rollback)
+        so that cascade events sourced from that service stop firing.
+        """
+        self._active.pop(service_name, None)
+
+    # ── Cascade ───────────────────────────────────────────────────────────
 
     def cascade(self, registry: ServiceRegistry) -> None:
         """Propagate degradation to downstream services listed in cascade_to."""
@@ -126,10 +145,11 @@ class FailureInjector(BaseModel):
                     dst.derive_status()
                     dst.emit_log(
                         "WARN",
-                        f"Degraded — upstream {src_name} failure.",
+                        f"Degraded by upstream failure in {src_name}. "
+                        f"Fix {src_name} first before restarting this service.",
                     )
 
-    # ── Auto-heal tick ───────────────────────────────────────────────────
+    # ── Auto-heal tick ────────────────────────────────────────────────────
 
     def tick_heal(self, registry: ServiceRegistry) -> None:
         """Decrement heal timers; heal services whose timer reaches zero."""
@@ -137,7 +157,6 @@ class FailureInjector(BaseModel):
             remaining: List[Tuple[FailureEvent, Optional[int]]] = []
             for event, steps_left in self._active[svc_name]:
                 if steps_left is None:
-                    # manual-only — keep tracking for cascade
                     remaining.append((event, None))
                     continue
                 steps_left -= 1
@@ -145,7 +164,7 @@ class FailureInjector(BaseModel):
                     svc = registry.get_service(svc_name)
                     if svc is not None:
                         svc.reset_to_healthy()
-                        svc.emit_log("INFO", f"Auto-healed ({event.failure_type}).")
+                        svc.emit_log("INFO", f"Auto-healed after {event.failure_type}.")
                 else:
                     remaining.append((event, steps_left))
             if remaining:

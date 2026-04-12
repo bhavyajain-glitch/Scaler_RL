@@ -20,6 +20,7 @@ from env.services import ServiceRegistry
 from tasks.easy import TASK as EASY_TASK, grade as easy_grade
 from tasks.medium import TASK as MEDIUM_TASK, grade as medium_grade
 from tasks.hard import TASK as HARD_TASK, grade as hard_grade
+from tasks.expert import TASK as EXPERT_TASK, grade as expert_grade
 
 
 # ── FastAPI app ──────────────────────────────────────────────────────────────
@@ -33,9 +34,10 @@ app = FastAPI(
 # ── Task registry ────────────────────────────────────────────────────────────
 
 TASKS = {
-    "easy_db_crash": {"task": EASY_TASK, "grade": easy_grade},
-    "medium_api_latency_worker_oom": {"task": MEDIUM_TASK, "grade": medium_grade},
-    "hard_cascading_db_lock": {"task": HARD_TASK, "grade": hard_grade},
+    "easy_db_crash":                  {"task": EASY_TASK,   "grade": easy_grade},
+    "medium_api_latency_worker_oom":  {"task": MEDIUM_TASK, "grade": medium_grade},
+    "hard_cascading_db_lock":         {"task": HARD_TASK,   "grade": hard_grade},
+    "expert_red_herring":             {"task": EXPERT_TASK, "grade": expert_grade},
 }
 
 # ── Session storage (in-memory, single-user for hackathon) ───────────────────
